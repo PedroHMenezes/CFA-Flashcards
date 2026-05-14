@@ -980,6 +980,12 @@ function App() {
 
   // ── Sync helpers ─────────────────────────────────────────────────────────
 
+  // Toast helper — must be defined before sync callbacks reference it
+  const showToast = useCallback((msg, type = 'info') => {
+    setToast({ msg, type });
+    setTimeout(() => setToast(null), 2400);
+  }, []);
+
   // Apply a remote blob to local state — called after a successful pull
   const applyBlob = useCallback((blob) => {
     if (!blob) return;
@@ -1059,13 +1065,7 @@ function App() {
       return;
     }
     await pullFromSupabase(syncConfig, cards, settings, stats, planProgress);
-  }, [syncConfig, cards, settings, stats, planProgress, pullFromSupabase]);
-
-  // Toast helper
-  const showToast = useCallback((msg, type = 'info') => {
-    setToast({ msg, type });
-    setTimeout(() => setToast(null), 2400);
-  }, []);
+  }, [syncConfig, cards, settings, stats, planProgress, pullFromSupabase, showToast]);
 
   // ── Card operations ────────────────────────────────────────────────────────
   const addCard = useCallback((data) => {
