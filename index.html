@@ -964,6 +964,10 @@ function App() {
 
   // Debounce timer ref for auto-push
   const pushTimerRef = useRef(null);
+  // Tracks the server-side updated_at timestamp of the last blob we've seen.
+  // Used by pullFromSupabase to decide whether the remote has new data.
+  // 0 means "never synced from server" — first pull always applies.
+  const lastKnownRemoteTsRef = useRef(0);
 
   // Persist locally
   useEffect(() => { saveCards(cards); }, [cards]);
@@ -1002,7 +1006,10 @@ function App() {
     setSyncError(null);
     try {
       const blob = buildBlob(currentCards, currentSettings, currentStats, currentPlan);
-      await supabasePush(cfg, blob);
+      const serverTs = await supabasePush(cfg, blob);
+      // Track the server timestamp of what we just pushed — this is the
+      // "high water mark" we compare future pulls against.
+      lastKnownRemoteTsRef.current = new Date(serverTs).getTime();
       setSyncStatus('synced');
       setLastSyncedAt(Date.now());
     } catch (e) {
@@ -1012,24 +1019,29 @@ function App() {
     }
   }, []);
 
-  // Pull from Supabase and merge with local — newer timestamp wins
-  const pullFromSupabase = useCallback(async (cfg, currentCards, currentSettings, currentStats, currentPlan) => {
+  // Pull from Supabase. Apply remote blob if the server has data we haven't
+  // seen yet (server timestamp > our high-water mark). Push if remote is empty.
+  const pullFromSupabase = useCallback(async (cfg, currentCards, currentSettings, currentStats, currentPlan, opts = {}) => {
     if (!cfg.enabled || !cfg.syncId) return;
-    setSyncStatus('syncing');
+    const silent = !!opts.silent;
+    if (!silent) setSyncStatus('syncing');
     setSyncError(null);
     try {
       const remote = await supabasePull(cfg);
       if (!remote) {
-        // No remote row yet — push local state to seed it
+        // No remote row yet — seed it from local state
         await pushToSupabase(cfg, currentCards, currentSettings, currentStats, currentPlan);
         return;
       }
       const remoteTs = new Date(remote.updated_at).getTime();
-      const localTs = remote.data?.savedAt || 0;
-      // If remote is newer than what we last pushed, apply it
-      if (remoteTs > (lastSyncedAt || 0) && remoteTs > localTs) {
+      const knownTs  = lastKnownRemoteTsRef.current || 0;
+      // First sync on this device (knownTs === 0): always apply the remote.
+      // Subsequent syncs: only apply if remote is strictly newer than what we
+      // last saw — protects us from re-applying our own pushes.
+      if (knownTs === 0 || remoteTs > knownTs) {
         applyBlob(remote.data);
-        showToast('Synced — loaded latest data from cloud');
+        lastKnownRemoteTsRef.current = remoteTs;
+        if (!silent && knownTs > 0) showToast('Synced — loaded latest from cloud');
       }
       setSyncStatus('synced');
       setLastSyncedAt(Date.now());
@@ -1038,7 +1050,7 @@ function App() {
       setSyncStatus(isOffline ? 'offline' : 'error');
       setSyncError(e.message);
     }
-  }, [applyBlob, pushToSupabase, lastSyncedAt, showToast]);
+  }, [applyBlob, pushToSupabase, showToast]);
 
   // On app load: pull from Supabase if enabled
   useEffect(() => {
@@ -1047,6 +1059,40 @@ function App() {
     }
   // eslint-disable-next-line react-hooks/exhaustive-deps
   }, []); // only on mount
+
+  // Pull again when the tab becomes visible (e.g. switching back from another
+  // app on phone, or unlocking the screen). This is what makes cross-device
+  // sync feel instant — open the phone, the latest data appears.
+  useEffect(() => {
+    if (!syncConfig.enabled || !syncConfig.syncId) return;
+    const onVisible = () => {
+      if (document.visibilityState === 'visible') {
+        pullFromSupabase(syncConfig, cards, settings, stats, planProgress, { silent: true });
+      }
+    };
+    const onFocus = () => onVisible();
+    const onOnline = () => onVisible();
+    document.addEventListener('visibilitychange', onVisible);
+    window.addEventListener('focus', onFocus);
+    window.addEventListener('online', onOnline);
+    return () => {
+      document.removeEventListener('visibilitychange', onVisible);
+      window.removeEventListener('focus', onFocus);
+      window.removeEventListener('online', onOnline);
+    };
+  // eslint-disable-next-line react-hooks/exhaustive-deps
+  }, [syncConfig.enabled, syncConfig.syncId]);
+
+  // Background poll every 30s — backup for when visibility events don't fire
+  // (e.g. two browser windows open side by side). Cheap: one tiny REST call.
+  useEffect(() => {
+    if (!syncConfig.enabled || !syncConfig.syncId) return;
+    const intervalId = setInterval(() => {
+      pullFromSupabase(syncConfig, cards, settings, stats, planProgress, { silent: true });
+    }, 30000);
+    return () => clearInterval(intervalId);
+  // eslint-disable-next-line react-hooks/exhaustive-deps
+  }, [syncConfig.enabled, syncConfig.syncId]);
 
   // Debounced auto-push whenever state changes
   useEffect(() => {
@@ -3772,7 +3818,7 @@ function SettingsView({ settings, setSettings, exportJSON, exportCSV, importJSON
               <Input
                 value={syncIdDraft}
                 onChange={(e) => setSyncIdDraft(e.target.value)}
-                placeholder="xxx"
+                placeholder="e.g. pedro-cfa-2026"
                 className="flex-1 font-mono"
                 onKeyDown={(e) => { if (e.key === 'Enter') saveSyncId(); }}
               />
