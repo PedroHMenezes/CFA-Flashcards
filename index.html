@@ -302,8 +302,91 @@ const DIFFICULTIES = ['Easy', 'Medium', 'Hard'];
 const STORAGE_KEY = 'cfa-l3-flashcards-v1';
 const SETTINGS_KEY = 'cfa-l3-settings-v1';
 const STATS_KEY = 'cfa-l3-stats-v1';
-const PLAN_KEY = 'cfa-l3-plan-progress-v1'; // per-date status & notes for the study plan
-const INIT_KEY = 'cfa-l3-initialized-v1'; // set true after first launch so we never re-seed
+const PLAN_KEY = 'cfa-l3-plan-progress-v1';
+const INIT_KEY = 'cfa-l3-initialized-v1';
+const SYNC_KEY = 'cfa-l3-sync-config-v1'; // { url, anonKey, syncId } — never committed to git
+
+// Supabase project defaults (anon key is safe to embed — restricted by RLS policy)
+// User can override these in Settings, or add their own project URL.
+const SUPABASE_DEFAULT_URL  = 'https://qenxbveinquirlfrdfch.supabase.co';
+const SUPABASE_DEFAULT_ANON = 'eyJhbGciOiJIUzI1NiIsInR5cCI6IkpXVCJ9.eyJpc3MiOiJzdXBhYmFzZSIsInJlZiI6InFlbnhidmVpbnF1aXJsZnJkZmNoIiwicm9sZSI6ImFub24iLCJpYXQiOjE3Nzg3MDkzOTAsImV4cCI6MjA5NDI4NTM5MH0.K5iv3q3UiIF5IdklV_2zSiyC-BByvrCbJL-_LYJulDY';
+
+// ─────────────────────────────────────────────────────────────────────────────
+// SUPABASE SYNC LAYER
+// Strategy: localStorage is primary (instant, offline-capable).
+// Supabase is a sync mirror — one row per syncId in the cfa_sync table.
+// On load: fetch remote blob, compare updated_at, use whichever is newer.
+// On change: debounced push (3 s) so we don't spam on every keystroke.
+// On conflict: last-write-wins by updated_at timestamp.
+// If Supabase is unreachable: app works normally, retries silently.
+// ─────────────────────────────────────────────────────────────────────────────
+
+function loadSyncConfig() {
+  try {
+    const raw = localStorage.getItem(SYNC_KEY);
+    if (raw) return JSON.parse(raw);
+  } catch (e) { /* noop */ }
+  return {
+    url: SUPABASE_DEFAULT_URL,
+    anonKey: SUPABASE_DEFAULT_ANON,
+    syncId: '',       // user sets this once — e.g. "pedro-cfa-2026"
+    enabled: false,   // disabled until syncId is set
+  };
+}
+
+function saveSyncConfig(cfg) {
+  try { localStorage.setItem(SYNC_KEY, JSON.stringify(cfg)); }
+  catch (e) { /* noop */ }
+}
+
+// Low-level Supabase REST helpers — no SDK needed, plain fetch.
+async function sbRequest(cfg, method, body = null) {
+  const url = `${cfg.url}/rest/v1/cfa_sync`;
+  const headers = {
+    'apikey': cfg.anonKey,
+    'Authorization': `Bearer ${cfg.anonKey}`,
+    'Content-Type': 'application/json',
+    'Prefer': method === 'POST' ? 'resolution=merge-duplicates,return=representation' : 'return=representation',
+  };
+  const res = await fetch(
+    method === 'GET' ? `${url}?id=eq.${encodeURIComponent(cfg.syncId)}&select=data,updated_at` : url,
+    { method, headers, body: body ? JSON.stringify(body) : null }
+  );
+  if (!res.ok) {
+    const text = await res.text().catch(() => '');
+    throw new Error(`Supabase ${method} ${res.status}: ${text.slice(0, 120)}`);
+  }
+  return res.status === 204 ? null : res.json();
+}
+
+// Pull latest blob from Supabase. Returns { data, updated_at } or null.
+async function supabasePull(cfg) {
+  const rows = await sbRequest(cfg, 'GET');
+  if (!rows || rows.length === 0) return null;
+  return rows[0]; // { data: {...}, updated_at: "ISO string" }
+}
+
+// Push full state blob to Supabase (upsert).
+async function supabasePush(cfg, blob) {
+  const now = new Date().toISOString();
+  await sbRequest(cfg, 'POST', {
+    id: cfg.syncId,
+    data: blob,
+    updated_at: now,
+  });
+  return now;
+}
+
+// Build a complete state blob from current React state.
+function buildBlob(cards, settings, stats, planProgress) {
+  return {
+    cards,
+    settings,
+    stats,
+    planProgress,
+    savedAt: Date.now(),
+  };
+}
 
 // ─────────────────────────────────────────────────────────────────────────────
 // SM-2 SPACED REPETITION
@@ -869,22 +952,114 @@ function App() {
   const [settings, setSettings] = useState(loadSettings);
   const [stats, setStats] = useState(loadStats);
   const [planProgress, setPlanProgress] = useState(loadPlanProgress);
-  const [view, setView] = useState('dashboard'); // dashboard | review | browse | create | analytics | plan
+  const [syncConfig, setSyncConfig] = useState(loadSyncConfig);
+  // syncStatus: 'idle' | 'syncing' | 'synced' | 'error' | 'offline'
+  const [syncStatus, setSyncStatus] = useState('idle');
+  const [syncError, setSyncError] = useState(null);
+  const [lastSyncedAt, setLastSyncedAt] = useState(null);
+  const [view, setView] = useState('dashboard');
   const [editingCard, setEditingCard] = useState(null);
   const [reviewFilter, setReviewFilter] = useState({ scope: 'due', topic: 'all', tag: 'all', difficulty: 'all' });
   const [toast, setToast] = useState(null);
 
-  // Persist
+  // Debounce timer ref for auto-push
+  const pushTimerRef = useRef(null);
+
+  // Persist locally
   useEffect(() => { saveCards(cards); }, [cards]);
   useEffect(() => { saveSettings(settings); }, [settings]);
   useEffect(() => { saveStats(stats); }, [stats]);
   useEffect(() => { savePlanProgress(planProgress); }, [planProgress]);
+  useEffect(() => { saveSyncConfig(syncConfig); }, [syncConfig]);
 
   // Theme
   useEffect(() => {
     if (settings.theme === 'dark') document.documentElement.classList.add('dark');
     else document.documentElement.classList.remove('dark');
   }, [settings.theme]);
+
+  // ── Sync helpers ─────────────────────────────────────────────────────────
+
+  // Apply a remote blob to local state — called after a successful pull
+  const applyBlob = useCallback((blob) => {
+    if (!blob) return;
+    if (Array.isArray(blob.cards)) setCards(blob.cards);
+    if (blob.settings) setSettings(s => ({ ...s, ...blob.settings, theme: s.theme })); // keep local theme
+    if (blob.stats) setStats(blob.stats);
+    if (blob.planProgress) setPlanProgress(blob.planProgress);
+  }, []);
+
+  // Push current state to Supabase
+  const pushToSupabase = useCallback(async (cfg, currentCards, currentSettings, currentStats, currentPlan) => {
+    if (!cfg.enabled || !cfg.syncId) return;
+    setSyncStatus('syncing');
+    setSyncError(null);
+    try {
+      const blob = buildBlob(currentCards, currentSettings, currentStats, currentPlan);
+      await supabasePush(cfg, blob);
+      setSyncStatus('synced');
+      setLastSyncedAt(Date.now());
+    } catch (e) {
+      const isOffline = !navigator.onLine || e.message.includes('fetch');
+      setSyncStatus(isOffline ? 'offline' : 'error');
+      setSyncError(e.message);
+    }
+  }, []);
+
+  // Pull from Supabase and merge with local — newer timestamp wins
+  const pullFromSupabase = useCallback(async (cfg, currentCards, currentSettings, currentStats, currentPlan) => {
+    if (!cfg.enabled || !cfg.syncId) return;
+    setSyncStatus('syncing');
+    setSyncError(null);
+    try {
+      const remote = await supabasePull(cfg);
+      if (!remote) {
+        // No remote row yet — push local state to seed it
+        await pushToSupabase(cfg, currentCards, currentSettings, currentStats, currentPlan);
+        return;
+      }
+      const remoteTs = new Date(remote.updated_at).getTime();
+      const localTs = remote.data?.savedAt || 0;
+      // If remote is newer than what we last pushed, apply it
+      if (remoteTs > (lastSyncedAt || 0) && remoteTs > localTs) {
+        applyBlob(remote.data);
+        showToast('Synced — loaded latest data from cloud');
+      }
+      setSyncStatus('synced');
+      setLastSyncedAt(Date.now());
+    } catch (e) {
+      const isOffline = !navigator.onLine || e.message.includes('fetch');
+      setSyncStatus(isOffline ? 'offline' : 'error');
+      setSyncError(e.message);
+    }
+  }, [applyBlob, pushToSupabase, lastSyncedAt, showToast]);
+
+  // On app load: pull from Supabase if enabled
+  useEffect(() => {
+    if (syncConfig.enabled && syncConfig.syncId) {
+      pullFromSupabase(syncConfig, cards, settings, stats, planProgress);
+    }
+  // eslint-disable-next-line react-hooks/exhaustive-deps
+  }, []); // only on mount
+
+  // Debounced auto-push whenever state changes
+  useEffect(() => {
+    if (!syncConfig.enabled || !syncConfig.syncId) return;
+    if (pushTimerRef.current) clearTimeout(pushTimerRef.current);
+    pushTimerRef.current = setTimeout(() => {
+      pushToSupabase(syncConfig, cards, settings, stats, planProgress);
+    }, 3000);
+    return () => clearTimeout(pushTimerRef.current);
+  }, [cards, stats, planProgress, syncConfig, pushToSupabase, settings]);
+
+  // Manual sync — exposed to Settings view
+  const manualSync = useCallback(async () => {
+    if (!syncConfig.enabled || !syncConfig.syncId) {
+      showToast('Enable sync and set a Sync ID in Settings first', 'error');
+      return;
+    }
+    await pullFromSupabase(syncConfig, cards, settings, stats, planProgress);
+  }, [syncConfig, cards, settings, stats, planProgress, pullFromSupabase]);
 
   // Toast helper
   const showToast = useCallback((msg, type = 'info') => {
@@ -1141,7 +1316,7 @@ function App() {
   // ── Render ────────────────────────────────────────────────────────────────
   return (
     <div className="min-h-screen paper-grain">
-      <Nav view={view} setView={setView} settings={settings} setSettings={setSettings} dueCount={derived.dueToday.length} />
+      <Nav view={view} setView={setView} settings={settings} setSettings={setSettings} dueCount={derived.dueToday.length} syncStatus={syncStatus} syncError={syncError} lastSyncedAt={lastSyncedAt} />
 
       <main className="max-w-6xl mx-auto px-4 sm:px-6 pb-24 pt-6">
         {view === 'dashboard' && (
@@ -1191,6 +1366,9 @@ function App() {
             importJSON={importJSON} importCSV={importCSV}
             cards={cards} setCards={setCards} setStats={setStats}
             showToast={showToast}
+            syncConfig={syncConfig} setSyncConfig={setSyncConfig}
+            syncStatus={syncStatus} syncError={syncError} lastSyncedAt={lastSyncedAt}
+            manualSync={manualSync} setPlanProgress={setPlanProgress}
           />
         )}
       </main>
@@ -1217,7 +1395,7 @@ function App() {
 // NAV
 // ─────────────────────────────────────────────────────────────────────────────
 
-function Nav({ view, setView, settings, setSettings, dueCount }) {
+function Nav({ view, setView, settings, setSettings, dueCount, syncStatus, syncError, lastSyncedAt }) {
   const items = [
     { key: 'dashboard', label: 'Dashboard' },
     { key: 'plan', label: 'Plan' },
@@ -1226,6 +1404,16 @@ function Nav({ view, setView, settings, setSettings, dueCount }) {
     { key: 'create', label: 'Create' },
     { key: 'analytics', label: 'Analytics' },
   ];
+
+  // Sync indicator config
+  const syncDot = {
+    idle:    { color: 'bg-ink/20 dark:bg-paper/20', title: 'Sync not configured' },
+    syncing: { color: 'bg-ochre animate-pulse', title: 'Syncing…' },
+    synced:  { color: 'bg-moss', title: lastSyncedAt ? `Synced ${new Date(lastSyncedAt).toLocaleTimeString()}` : 'Synced' },
+    error:   { color: 'bg-rust', title: `Sync error: ${syncError || 'unknown'}` },
+    offline: { color: 'bg-ochre', title: 'Offline — will sync when connection returns' },
+  }[syncStatus] || { color: 'bg-ink/20 dark:bg-paper/20', title: '' };
+
   return (
     <header className="border-b border-ink/8 dark:border-paper/8 bg-paper/85 dark:bg-ink/85 backdrop-blur-md sticky top-0 z-40">
       <div className="max-w-6xl mx-auto px-4 sm:px-6 py-3.5 flex items-center justify-between gap-4">
@@ -1250,6 +1438,14 @@ function Nav({ view, setView, settings, setSettings, dueCount }) {
           ))}
         </nav>
         <div className="flex items-center gap-2">
+          {/* Sync status dot — click to go to settings */}
+          <button onClick={() => setView('settings')} title={syncDot.title}
+            className="flex items-center gap-1.5 p-1.5 rounded-md hover:bg-paper-2 dark:hover:bg-ink-soft transition">
+            <div className={`w-2 h-2 rounded-full ${syncDot.color}`} />
+            <span className="text-xs text-ink/50 dark:text-paper/50 hidden lg:inline">
+              {syncStatus === 'synced' ? 'synced' : syncStatus === 'syncing' ? 'syncing…' : syncStatus === 'error' ? 'sync error' : syncStatus === 'offline' ? 'offline' : ''}
+            </span>
+          </button>
           <button
             onClick={() => setSettings(s => ({ ...s, theme: s.theme === 'dark' ? 'light' : 'dark' }))}
             className="p-2 rounded-md hover:bg-paper-2 dark:hover:bg-ink-soft transition"
@@ -3491,9 +3687,10 @@ function Analytics({ cards, stats, derived }) {
 // SETTINGS
 // ─────────────────────────────────────────────────────────────────────────────
 
-function SettingsView({ settings, setSettings, exportJSON, exportCSV, importJSON, importCSV, cards, setCards, setStats, showToast }) {
+function SettingsView({ settings, setSettings, exportJSON, exportCSV, importJSON, importCSV, cards, setCards, setStats, showToast, syncConfig, setSyncConfig, syncStatus, syncError, lastSyncedAt, manualSync, setPlanProgress }) {
   const jsonInputRef = useRef(null);
   const csvInputRef = useRef(null);
+  const [syncIdDraft, setSyncIdDraft] = useState(syncConfig.syncId || '');
 
   const wipeAll = () => {
     const ok = confirm(
@@ -3508,7 +3705,6 @@ function SettingsView({ settings, setSettings, exportJSON, exportCSV, importJSON
     try {
       localStorage.removeItem(STORAGE_KEY);
       localStorage.removeItem(STATS_KEY);
-      // Keep INIT_KEY set so we don't re-seed
       localStorage.setItem(INIT_KEY, '1');
     } catch (e) { console.error('clear failed', e); }
     showToast('All cards and stats cleared');
@@ -3523,10 +3719,123 @@ function SettingsView({ settings, setSettings, exportJSON, exportCSV, importJSON
     showToast('SR progress reset');
   };
 
+  const saveSyncId = () => {
+    const id = syncIdDraft.trim().toLowerCase().replace(/[^a-z0-9-]/g, '-').replace(/-+/g, '-');
+    if (!id) { showToast('Sync ID cannot be empty', 'error'); return; }
+    setSyncConfig(c => ({ ...c, syncId: id, enabled: true }));
+    showToast(`Sync ID set to "${id}" — syncing enabled`);
+  };
+
+  const disableSync = () => {
+    setSyncConfig(c => ({ ...c, enabled: false }));
+    showToast('Cloud sync disabled');
+  };
+
+  const statusColors = {
+    idle:    'text-ink/50 dark:text-paper/50',
+    syncing: 'text-ochre',
+    synced:  'text-moss',
+    error:   'text-rust',
+    offline: 'text-ochre',
+  };
+  const statusLabels = {
+    idle:    'Not configured',
+    syncing: 'Syncing…',
+    synced:  lastSyncedAt ? `Synced at ${new Date(lastSyncedAt).toLocaleTimeString()}` : 'Synced',
+    error:   `Error: ${syncError || 'unknown'}`,
+    offline: 'Offline — will sync on reconnect',
+  };
+
   return (
     <div className="fade-in max-w-3xl mx-auto space-y-4">
       <h1 className="font-serif text-3xl md:text-4xl font-medium">Settings</h1>
 
+      {/* ── Cloud sync ─────────────────────────────────────────────────── */}
+      <Card className="p-5">
+        <div className="flex items-start justify-between gap-3 mb-1">
+          <h2 className="font-serif text-xl font-medium">Cloud sync</h2>
+          <div className={`text-xs font-medium mt-1 ${statusColors[syncStatus] || statusColors.idle}`}>
+            ● {statusLabels[syncStatus] || statusLabels.idle}
+          </div>
+        </div>
+        <p className="text-sm text-ink/65 dark:text-paper/65 mb-4">
+          Keeps your cards, review history, and plan progress in sync across all your devices automatically. Uses your Supabase project — data never touches any third-party server.
+        </p>
+
+        {/* Sync ID input */}
+        <div className="space-y-3">
+          <div>
+            <label className="block text-xs uppercase tracking-widest text-ink/55 dark:text-paper/55 mb-1.5 font-medium">
+              Sync ID <span className="opacity-60 normal-case tracking-normal font-normal">— choose any unique identifier, e.g. your name</span>
+            </label>
+            <div className="flex gap-2">
+              <Input
+                value={syncIdDraft}
+                onChange={(e) => setSyncIdDraft(e.target.value)}
+                placeholder="e.g. pedro-cfa-2026"
+                className="flex-1 font-mono"
+                onKeyDown={(e) => { if (e.key === 'Enter') saveSyncId(); }}
+              />
+              <Btn variant="rust" onClick={saveSyncId}>
+                {syncConfig.enabled ? 'Update' : 'Enable sync'}
+              </Btn>
+            </div>
+            <p className="text-xs text-ink/55 dark:text-paper/55 mt-1.5">
+              Use the same ID on every device. Only lowercase letters, numbers, and hyphens. This is your personal row key in the database — anyone who knows it and your anon key can read your data, so don't use anything sensitive.
+            </p>
+          </div>
+
+          {/* Status + actions */}
+          {syncConfig.enabled && (
+            <div className="flex flex-wrap gap-2 items-center pt-1">
+              <Btn variant="outline" onClick={manualSync}>↻ Sync now</Btn>
+              <Btn variant="ghost" onClick={disableSync}>Disable sync</Btn>
+              <span className="text-xs text-ink/50 dark:text-paper/50">
+                Syncs automatically 3 s after any change
+              </span>
+            </div>
+          )}
+
+          {syncStatus === 'error' && (
+            <div className="text-xs text-rust bg-rust/8 border border-rust/20 rounded-md p-3">
+              <strong>Sync failed:</strong> {syncError}<br/>
+              <span className="opacity-80">Check that the SQL table was created correctly in Supabase and that your project URL and anon key are correct.</span>
+            </div>
+          )}
+
+          {/* Advanced: Supabase credentials */}
+          <details className="text-sm">
+            <summary className="cursor-pointer text-xs text-ink/55 dark:text-paper/55 hover:text-ink dark:hover:text-paper uppercase tracking-widest font-medium">
+              Advanced — Supabase credentials
+            </summary>
+            <div className="mt-3 space-y-3">
+              <p className="text-xs text-ink/60 dark:text-paper/60">
+                Your project URL and anon key are pre-filled. Only change these if you want to use a different Supabase project.
+              </p>
+              <div>
+                <label className="block text-xs uppercase tracking-widest text-ink/55 dark:text-paper/55 mb-1.5 font-medium">Project URL</label>
+                <Input
+                  value={syncConfig.url || SUPABASE_DEFAULT_URL}
+                  onChange={(e) => setSyncConfig(c => ({ ...c, url: e.target.value.trim() }))}
+                  className="font-mono text-xs"
+                  placeholder="https://xxxx.supabase.co"
+                />
+              </div>
+              <div>
+                <label className="block text-xs uppercase tracking-widest text-ink/55 dark:text-paper/55 mb-1.5 font-medium">Anon public key</label>
+                <Input
+                  value={syncConfig.anonKey || SUPABASE_DEFAULT_ANON}
+                  onChange={(e) => setSyncConfig(c => ({ ...c, anonKey: e.target.value.trim() }))}
+                  className="font-mono text-xs"
+                  placeholder="eyJhbGci..."
+                />
+              </div>
+            </div>
+          </details>
+        </div>
+      </Card>
+
+      {/* ── Daily goal ─────────────────────────────────────────────────── */}
       <Card className="p-5">
         <h2 className="font-serif text-xl font-medium mb-4">Daily goal</h2>
         <div className="flex items-center gap-3">
@@ -3540,14 +3849,15 @@ function SettingsView({ settings, setSettings, exportJSON, exportCSV, importJSON
         </div>
       </Card>
 
+      {/* ── Local backup ───────────────────────────────────────────────── */}
       <Card className="p-5">
-        <h2 className="font-serif text-xl font-medium mb-4">Backup & sync</h2>
+        <h2 className="font-serif text-xl font-medium mb-1">Local backup</h2>
         <p className="text-sm text-ink/65 dark:text-paper/65 mb-4">
-          All your data is stored in your browser only. Export regularly. To use across devices, export JSON and import on the other device.
+          Export a full JSON snapshot anytime. Useful before major changes or as an offline backup. Import restores everything including plan progress.
         </p>
         <div className="flex flex-wrap gap-2">
           <Btn variant="default" onClick={exportJSON}>Export JSON</Btn>
-          <Btn variant="outline" onClick={exportCSV}>Export CSV</Btn>
+          <Btn variant="outline" onClick={exportCSV}>Export cards as CSV</Btn>
           <Btn variant="outline" onClick={() => jsonInputRef.current?.click()}>Import JSON</Btn>
           <Btn variant="outline" onClick={() => csvInputRef.current?.click()}>Import CSV</Btn>
           <input ref={jsonInputRef} type="file" accept=".json,application/json" hidden
@@ -3560,6 +3870,7 @@ function SettingsView({ settings, setSettings, exportJSON, exportCSV, importJSON
         </div>
       </Card>
 
+      {/* ── Theme ──────────────────────────────────────────────────────── */}
       <Card className="p-5">
         <h2 className="font-serif text-xl font-medium mb-4">Theme</h2>
         <div className="flex gap-2">
@@ -3578,6 +3889,7 @@ function SettingsView({ settings, setSettings, exportJSON, exportCSV, importJSON
         </div>
       </Card>
 
+      {/* ── Danger zone ────────────────────────────────────────────────── */}
       <Card className="p-5 border-rust/30">
         <h2 className="font-serif text-xl font-medium mb-1">Danger zone</h2>
         <p className="text-sm text-ink/65 dark:text-paper/65 mb-4">Both actions are irreversible. Export first.</p>
@@ -3587,6 +3899,7 @@ function SettingsView({ settings, setSettings, exportJSON, exportCSV, importJSON
         </div>
       </Card>
 
+      {/* ── About SR ───────────────────────────────────────────────────── */}
       <Card className="p-5">
         <h2 className="font-serif text-xl font-medium mb-3">About the spaced repetition</h2>
         <p className="text-sm text-ink/70 dark:text-paper/70 leading-relaxed">
