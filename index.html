@@ -2965,22 +2965,54 @@ function Plan({ planProgress, updatePlanDay, setView, setReviewFilter, showToast
 
   // ── Today tab ──────────────────────────────────────────────────────────────
   const renderToday = () => {
-    if (!inPlanRange) {
-      const before = todayIdx < 0;
+    const before = todayIdx < 0;
+    const after = todayIdx >= STUDY_SCHEDULE.length;
+
+    if (after) {
       return (
         <Card className="p-8 text-center">
-          <div className="font-serif text-2xl mb-2">
-            {before ? 'Plan starts soon' : 'Plan complete'}
-          </div>
+          <div className="font-serif text-2xl mb-2">Plan complete</div>
           <p className="text-ink/60 dark:text-paper/60 max-w-md mx-auto">
-            {before
-              ? `Your study plan begins on ${new Date(STUDY_PLAN_START).toLocaleDateString(undefined, { weekday: 'long', month: 'long', day: 'numeric' })}. Until then, keep building flashcards.`
-              : 'The plan has ended. Good luck on (or after) exam day.'}
+            The plan has ended. Good luck on (or after) exam day.
           </p>
           <div className="mt-5">
             <Btn variant="outline" onClick={() => setTab('schedule')}>Browse full schedule</Btn>
           </div>
         </Card>
+      );
+    }
+
+    if (before) {
+      // Pre-start: show the tracker (it will read as 0 progress) plus a
+      // friendly "starts on" card and a peek at day 1.
+      const firstDay = STUDY_SCHEDULE[0];
+      const daysUntilStart = Math.max(0, Math.ceil((new Date(STUDY_PLAN_START) - new Date()) / 86400000));
+      return (
+        <div className="space-y-5">
+          {/* Tracker — empty actual, only planned line visible */}
+          <StudyTracker planProgress={planProgress} todayIdx={todayIdx} />
+
+          {/* Pre-start status card */}
+          <Card className="p-6 text-center">
+            <div className="text-xs uppercase tracking-widest text-ink/50 dark:text-paper/50 font-medium mb-2">
+              Plan starts in {daysUntilStart} {daysUntilStart === 1 ? 'day' : 'days'}
+            </div>
+            <div className="font-serif text-2xl mb-1">Get ready</div>
+            <p className="text-ink/60 dark:text-paper/60 text-sm max-w-md mx-auto">
+              Your study plan begins on {new Date(STUDY_PLAN_START).toLocaleDateString(undefined, { weekday: 'long', month: 'long', day: 'numeric' })}. Use these days to build your flashcard deck and warm up.
+            </p>
+            <div className="mt-4 flex gap-2 justify-center flex-wrap">
+              <Btn variant="rust" onClick={() => { setReviewFilter({ scope: 'due', topic: 'all', tag: 'all', difficulty: 'all' }); setView('review'); }}>Review flashcards</Btn>
+              <Btn variant="outline" onClick={() => setTab('schedule')}>Browse full schedule</Btn>
+            </div>
+          </Card>
+
+          {/* Day 1 preview */}
+          <div>
+            <div className="text-xs uppercase tracking-widest text-ink/50 dark:text-paper/50 font-medium mb-2 px-1">First day preview</div>
+            <ContextDayCard label={`Day 1 · ${new Date(firstDay.date + 'T00:00:00').toLocaleDateString(undefined, { weekday: 'long', month: 'short', day: 'numeric' })}`} day={firstDay} progress={planProgress[firstDay.date]} updatePlanDay={updatePlanDay} />
+          </div>
+        </div>
       );
     }
 
@@ -2990,10 +3022,13 @@ function Plan({ planProgress, updatePlanDay, setView, setReviewFilter, showToast
 
     return (
       <div className="space-y-5">
+        {/* Progress tracker — cumulative hours actual vs planned */}
+        <StudyTracker planProgress={planProgress} todayIdx={todayIdx} />
+
         {/* Today big card */}
         <DayCard day={today} progress={planProgress[today.date]} updatePlanDay={updatePlanDay} large
           onStartReview={() => { setReviewFilter({ scope: 'due', topic: 'all', tag: 'all', difficulty: 'all' }); setView('review'); }}
-          onLogMockMistake={() => { setView('create'); /* Create card defaults to Error Log via user choice */ }}
+          onLogMockMistake={() => { setView('create'); }}
         />
 
         {/* Yesterday / Tomorrow context */}
@@ -3221,6 +3256,252 @@ function PlanStat({ label, value, sub, pct }) {
         </div>
       )}
     </div>
+  );
+}
+
+// ─────────────────────────────────────────────────────────────────────────────
+// STUDY TRACKER — cumulative hours: actual (filled area) vs planned (dashed)
+// Mirrors the look of the Apple/Garmin training-load tracker reference, but
+// in the app's paper-and-ink palette. Hours-based because that's what the
+// plan is denominated in.
+// ─────────────────────────────────────────────────────────────────────────────
+
+function StudyTracker({ planProgress, todayIdx }) {
+  const isDark = typeof document !== 'undefined' && document.documentElement.classList.contains('dark');
+
+  // Build cumulative series — actualHours, plannedHours over every plan day
+  const series = useMemo(() => {
+    let cumActual = 0;
+    let cumPlanned = 0;
+    return STUDY_SCHEDULE.map((d, i) => {
+      cumPlanned += d.hours;
+      if (planProgress[d.date]?.status === 'done' && d.hours > 0) {
+        cumActual += d.hours;
+      }
+      return {
+        idx: i,
+        date: d.date,
+        actual: i <= todayIdx ? cumActual : null,  // only draw actual up to today
+        planned: cumPlanned,
+        isToday: i === todayIdx,
+      };
+    });
+  }, [planProgress, todayIdx]);
+
+  const totalPlanned = STUDY_PLAN_TOTAL_HOURS;
+  const todayPoint = todayIdx >= 0 && todayIdx < series.length ? series[todayIdx] : null;
+  const actualSoFar = todayPoint?.actual || 0;
+  const plannedSoFar = todayPoint?.planned || 0;
+  const progressPct = totalPlanned > 0 ? (actualSoFar / totalPlanned) * 100 : 0;
+  const onTrackPct = plannedSoFar > 0 ? (actualSoFar / plannedSoFar) * 100 : 0;
+  const planStarted = todayIdx >= 0;
+
+  // Projected completion date: at your current hours-per-day pace, when do you hit 100%?
+  // Only computed once the plan has started AND you have some actual progress.
+  const daysElapsed = todayIdx + 1; // inclusive
+  const pace = daysElapsed > 0 ? actualSoFar / daysElapsed : 0;
+  let readyDate = null;
+  if (planStarted && pace > 0) {
+    const remainingHours = Math.max(0, totalPlanned - actualSoFar);
+    const daysNeeded = remainingHours / pace;
+    const d = new Date();
+    d.setDate(d.getDate() + Math.ceil(daysNeeded));
+    readyDate = d;
+  }
+  const examDate = new Date(STUDY_PLAN_END);
+  // Only show on-pace pill once we have meaningful data (plan started + at least 7 days of progress)
+  const onPaceForExam = (planStarted && daysElapsed >= 7 && readyDate) ? readyDate <= examDate : null;
+
+  // Average hours per week — actual if plan started, otherwise show the planned average
+  let avgPerWeek;
+  let avgPerWeekLabel = 'Average per week';
+  if (planStarted) {
+    const recentWeeks = Math.min(4, Math.ceil(daysElapsed / 7));
+    const recentWindow = series.slice(Math.max(0, todayIdx - recentWeeks * 7), todayIdx + 1);
+    const recentActual = recentWindow.length > 1
+      ? (recentWindow[recentWindow.length - 1].actual || 0) - (recentWindow[0].actual || 0)
+      : actualSoFar;
+    avgPerWeek = recentWindow.length > 0 ? (recentActual / Math.max(1, recentWindow.length / 7)) : 0;
+  } else {
+    // Pre-start: show planned weekly average so the user knows what's coming
+    avgPerWeek = totalPlanned / (STUDY_SCHEDULE.length / 7);
+    avgPerWeekLabel = 'Planned per week';
+  }
+
+  // Days until exam (or until plan start, pre-start)
+  const daysToExam = Math.max(0, Math.ceil((examDate - new Date()) / 86400000));
+  const daysToStart = Math.max(0, Math.ceil((new Date(STUDY_PLAN_START) - new Date()) / 86400000));
+
+  // ── SVG geometry ──
+  const W = 560;
+  const H = 200;
+  const PADDING = { top: 20, right: 36, bottom: 36, left: 44 };
+  const innerW = W - PADDING.left - PADDING.right;
+  const innerH = H - PADDING.top - PADDING.bottom;
+
+  const xFor = (i) => PADDING.left + (i / (series.length - 1)) * innerW;
+  const yFor = (hours) => PADDING.top + innerH - (hours / totalPlanned) * innerH;
+
+  // Build SVG paths
+  const plannedPath = series.map((p, i) => `${i === 0 ? 'M' : 'L'} ${xFor(i)} ${yFor(p.planned)}`).join(' ');
+
+  const actualPoints = series.filter(p => p.actual != null);
+  const actualLinePath = actualPoints.map((p, i) => `${i === 0 ? 'M' : 'L'} ${xFor(p.idx)} ${yFor(p.actual)}`).join(' ');
+  const actualAreaPath = actualPoints.length > 0
+    ? `${actualLinePath} L ${xFor(actualPoints[actualPoints.length - 1].idx)} ${yFor(0)} L ${xFor(0)} ${yFor(0)} Z`
+    : '';
+
+  // Y-axis ticks: 0, 25, 50, 75, 100%
+  const yTicks = [0, 0.25, 0.5, 0.75, 1.0];
+
+  // X-axis labels: start, today, end
+  const startDate = new Date(STUDY_PLAN_START);
+  const fmtDate = (d) => d.toLocaleDateString(undefined, { month: 'short', day: 'numeric' });
+
+  // Theme colors (use rust as primary, ink-grey for planned reference)
+  const colors = {
+    actualStroke: '#c14a2b',
+    actualFillTop: 'rgba(193,74,43,0.28)',
+    actualFillBottom: 'rgba(193,74,43,0.02)',
+    plannedStroke: isDark ? 'rgba(232,230,227,0.42)' : 'rgba(10,25,41,0.40)',
+    axis: isDark ? 'rgba(232,230,227,0.55)' : 'rgba(10,25,41,0.55)',
+    grid: isDark ? 'rgba(232,230,227,0.08)' : 'rgba(10,25,41,0.08)',
+    todayLine: isDark ? 'rgba(232,230,227,0.20)' : 'rgba(10,25,41,0.20)',
+  };
+
+  return (
+    <Card className="p-5">
+      {/* Header */}
+      <div className="flex items-start justify-between mb-4 flex-wrap gap-3">
+        <h2 className="font-serif text-xl font-medium">My study plan</h2>
+        <div className="flex items-center gap-2 text-xs font-medium">
+          {!planStarted && (
+            <span className="inline-flex items-center gap-1.5 px-2 py-1 rounded-full bg-ochre/15 text-ochre border border-ochre/20">
+              <span className="w-1.5 h-1.5 rounded-full bg-ochre" />
+              {daysToStart === 0 ? 'Starts today' : `Starts in ${daysToStart}d`}
+            </span>
+          )}
+          {planStarted && onPaceForExam === true && (
+            <span className="inline-flex items-center gap-1.5 px-2 py-1 rounded-full bg-moss/10 text-moss border border-moss/20">
+              <span className="w-1.5 h-1.5 rounded-full bg-moss" /> On pace
+            </span>
+          )}
+          {planStarted && onPaceForExam === false && (
+            <span className="inline-flex items-center gap-1.5 px-2 py-1 rounded-full bg-rust/10 text-rust border border-rust/20">
+              <span className="w-1.5 h-1.5 rounded-full bg-rust" /> Behind pace
+            </span>
+          )}
+        </div>
+      </div>
+
+      {/* Headline stats row */}
+      <div className="grid grid-cols-2 gap-4 mb-5">
+        <div>
+          <div className="font-serif text-3xl md:text-4xl font-medium leading-none">
+            {avgPerWeek.toFixed(1)}<span className="text-lg text-ink/55 dark:text-paper/55 font-sans font-normal ml-1">h</span>
+          </div>
+          <div className="text-xs text-ink/55 dark:text-paper/55 mt-1.5 uppercase tracking-wider font-medium">{avgPerWeekLabel}</div>
+        </div>
+        <div>
+          <div className="font-serif text-3xl md:text-4xl font-medium leading-none">
+            {daysToExam}<span className="text-lg text-ink/55 dark:text-paper/55 font-sans font-normal ml-1">days</span>
+          </div>
+          <div className="text-xs text-ink/55 dark:text-paper/55 mt-1.5 uppercase tracking-wider font-medium">Until exam</div>
+        </div>
+      </div>
+
+      {/* Chart */}
+      <div className="overflow-x-auto -mx-2">
+        <svg viewBox={`0 0 ${W} ${H}`} width="100%" preserveAspectRatio="xMidYMid meet" style={{ maxWidth: '100%', minWidth: 360 }}>
+          <defs>
+            <linearGradient id="actualFillGrad" x1="0" y1="0" x2="0" y2="1">
+              <stop offset="0%" stopColor={colors.actualFillTop} />
+              <stop offset="100%" stopColor={colors.actualFillBottom} />
+            </linearGradient>
+          </defs>
+
+          {/* Horizontal grid lines + y-axis labels */}
+          {yTicks.map((t, i) => {
+            const y = PADDING.top + innerH - t * innerH;
+            return (
+              <g key={i}>
+                <line x1={PADDING.left} y1={y} x2={W - PADDING.right} y2={y}
+                  stroke={colors.grid} strokeWidth="1"
+                  strokeDasharray={t === 0 ? '0' : '2 4'} />
+                <text x={PADDING.left - 8} y={y + 3} textAnchor="end"
+                  fontSize="10" fill={colors.axis} fontFamily="Inter, sans-serif">
+                  {Math.round(t * 100)}%
+                </text>
+              </g>
+            );
+          })}
+
+          {/* Planned reference line (dashed) */}
+          <path d={plannedPath} fill="none" stroke={colors.plannedStroke}
+            strokeWidth="1.5" strokeDasharray="4 4" strokeLinecap="round" />
+
+          {/* End-of-plan marker (small ring, replaces tacky trophy) */}
+          <circle cx={xFor(series.length - 1)} cy={yFor(totalPlanned)} r="6"
+            fill="none" stroke={colors.plannedStroke} strokeWidth="1.5" />
+          <circle cx={xFor(series.length - 1)} cy={yFor(totalPlanned)} r="2.5"
+            fill={colors.plannedStroke} />
+
+          {/* Actual filled area */}
+          {actualAreaPath && <path d={actualAreaPath} fill="url(#actualFillGrad)" />}
+          {actualLinePath && <path d={actualLinePath} fill="none" stroke={colors.actualStroke}
+            strokeWidth="2" strokeLinecap="round" strokeLinejoin="round" />}
+
+          {/* "Today" marker on the actual curve */}
+          {todayPoint && todayPoint.actual != null && (
+            <>
+              <line x1={xFor(todayIdx)} y1={PADDING.top} x2={xFor(todayIdx)} y2={PADDING.top + innerH}
+                stroke={colors.todayLine} strokeWidth="1" strokeDasharray="2 3" />
+              <circle cx={xFor(todayIdx)} cy={yFor(todayPoint.actual)} r="5"
+                fill={isDark ? '#15161a' : '#fbf8f3'} stroke={colors.actualStroke} strokeWidth="2" />
+            </>
+          )}
+
+          {/* X-axis labels */}
+          <text x={PADDING.left} y={H - 14} textAnchor="start" fontSize="10" fill={colors.axis} fontFamily="Inter, sans-serif">
+            Start
+          </text>
+          <text x={PADDING.left} y={H - 2} textAnchor="start" fontSize="9.5" fill={colors.axis} opacity="0.7" fontFamily="Inter, sans-serif">
+            {fmtDate(startDate)}
+          </text>
+          <text x={W - PADDING.right} y={H - 14} textAnchor="end" fontSize="10" fill={colors.axis} fontFamily="Inter, sans-serif">
+            Exam
+          </text>
+          <text x={W - PADDING.right} y={H - 2} textAnchor="end" fontSize="9.5" fill={colors.axis} opacity="0.7" fontFamily="Inter, sans-serif">
+            {fmtDate(examDate)}
+          </text>
+        </svg>
+      </div>
+
+      {/* Footer summary */}
+      <div className="mt-4 pt-4 border-t border-ink/8 dark:border-paper/8 flex flex-wrap items-center gap-x-6 gap-y-3 text-sm">
+        <div className="flex items-center gap-2">
+          <span className="w-2.5 h-2.5 rounded-full bg-rust flex-shrink-0" />
+          <span className="text-ink/65 dark:text-paper/65">Progress:</span>
+          <span className="font-serif font-medium tabular-nums">{progressPct.toFixed(1)}%</span>
+        </div>
+        <div className="flex items-center gap-2">
+          <span className="w-2.5 h-2.5 rounded-full flex-shrink-0" style={{
+            background: !planStarted ? 'rgba(10,25,41,0.25)' : (onPaceForExam === false ? '#c14a2b' : '#5a7a4f')
+          }} />
+          <span className="text-ink/65 dark:text-paper/65">Ready date:</span>
+          <span className="font-serif font-medium tabular-nums">
+            {readyDate ? readyDate.toLocaleDateString(undefined, { month: 'short', day: 'numeric' }) : (planStarted ? 'pending' : '—')}
+          </span>
+        </div>
+        <div className="flex items-center gap-2">
+          <span className="inline-block w-4 h-0 border-t border-dashed flex-shrink-0" style={{ borderColor: colors.plannedStroke }} />
+          <span className="text-ink/65 dark:text-paper/65">Planned pace</span>
+        </div>
+        <div className="ml-auto text-xs text-ink/55 dark:text-paper/55 tabular-nums">
+          {actualSoFar.toFixed(1)}h / {totalPlanned}h
+        </div>
+      </div>
+    </Card>
   );
 }
 
