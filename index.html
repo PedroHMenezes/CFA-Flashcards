@@ -477,7 +477,7 @@ function loadPlanProgress() {
     const raw = localStorage.getItem(PLAN_KEY);
     if (raw) return JSON.parse(raw);
   } catch (e) { /* noop */ }
-  // { 'YYYY-MM-DD': { status: 'done'|'skipped', notes: '', completedAt: ts, mockScore: null } }
+  // { 'YYYY-MM-DD': { status: 'done'|'skipped', notes: '', completedAt: ts, mockScore: null, questionsAnswered: null } }
   return {};
 }
 
@@ -1170,7 +1170,7 @@ function App() {
       const current = next[dateKey] || {};
       next[dateKey] = { ...current, ...patch };
       // If clearing status, drop the entry to keep storage lean
-      if (next[dateKey].status === undefined && !next[dateKey].notes && next[dateKey].mockScore == null) {
+      if (next[dateKey].status === undefined && !next[dateKey].notes && next[dateKey].mockScore == null && next[dateKey].questionsAnswered == null) {
         delete next[dateKey];
       }
       return next;
@@ -3612,70 +3612,96 @@ function getScoreLabel(day) {
   return 'Session score';
 }
 
-// Reusable score input — appears in DayCard and DayDetailModal
-function ScoreInput({ day, progress, updatePlanDay, compact }) {
-  const [draft, setDraft] = useState(progress?.mockScore != null ? String(progress.mockScore) : '');
+// Single numeric input cell — score (0-100, %) OR question count (0-999, int).
+// Used inside SessionMetrics so the two fields render with identical look.
+function MetricInput({ day, progress, field, label, max, step, suffix, integer, colorize, hint, updatePlanDay }) {
+  const value = progress?.[field];
+  const [draft, setDraft] = useState(value != null ? String(value) : '');
 
-  // Sync local draft when underlying progress changes from elsewhere
   useEffect(() => {
-    setDraft(progress?.mockScore != null ? String(progress.mockScore) : '');
-  }, [progress?.mockScore]);
+    setDraft(value != null ? String(value) : '');
+  }, [value]);
 
   const commit = (val) => {
     const trimmed = String(val).trim();
     if (trimmed === '') {
-      updatePlanDay(day.date, { mockScore: null });
+      updatePlanDay(day.date, { [field]: null });
       return;
     }
     const num = parseFloat(trimmed);
-    if (isNaN(num) || num < 0 || num > 100) return; // ignore invalid silently
-    const rounded = Math.round(num * 10) / 10; // 1 decimal
-    updatePlanDay(day.date, { mockScore: rounded });
+    if (isNaN(num) || num < 0 || num > max) return;
+    const final = integer ? Math.round(num) : Math.round(num * 10) / 10;
+    updatePlanDay(day.date, { [field]: final });
   };
 
   const handleBlur = () => commit(draft);
   const handleKey = (e) => {
     if (e.key === 'Enter') { e.target.blur(); }
-    if (e.key === 'Escape') { setDraft(progress?.mockScore != null ? String(progress.mockScore) : ''); e.target.blur(); }
+    if (e.key === 'Escape') { setDraft(value != null ? String(value) : ''); e.target.blur(); }
   };
 
-  const label = getScoreLabel(day);
-  const scoreColor = progress?.mockScore == null
-    ? 'text-ink/55 dark:text-paper/55'
-    : progress.mockScore >= 70 ? 'text-moss'
-    : progress.mockScore >= 55 ? 'text-ochre'
+  // Color cue — only used for score; not meaningful for counts
+  const textColor = !colorize || value == null
+    ? 'text-ink dark:text-paper'
+    : value >= 70 ? 'text-moss'
+    : value >= 55 ? 'text-ochre'
     : 'text-rust';
 
   return (
-    <div className={compact ? '' : ''}>
+    <div>
       <label className="block text-[10px] uppercase tracking-widest text-ink/55 dark:text-paper/55 mb-1 font-medium">
         {label}
       </label>
-      <div className="flex items-center gap-2">
+      <div className="flex items-center gap-1.5">
         <Input
           type="number"
-          min="0" max="100" step="0.5"
+          min="0" max={max} step={step}
           value={draft}
           onChange={(e) => setDraft(e.target.value)}
           onBlur={handleBlur}
           onKeyDown={handleKey}
           placeholder="—"
-          className={`w-20 text-sm font-serif text-center tabular-nums font-medium ${scoreColor}`}
+          className={`w-20 text-sm font-serif text-center tabular-nums font-medium ${textColor}`}
         />
-        <span className="text-sm text-ink/55 dark:text-paper/55">%</span>
-        {progress?.mockScore != null && (
+        {suffix && <span className="text-sm text-ink/55 dark:text-paper/55">{suffix}</span>}
+        {value != null && (
           <button
-            onClick={() => { setDraft(''); updatePlanDay(day.date, { mockScore: null }); }}
-            className="text-xs text-ink/40 dark:text-paper/40 hover:text-rust transition"
-            title="Clear score"
+            onClick={() => { setDraft(''); updatePlanDay(day.date, { [field]: null }); }}
+            className="text-[11px] text-ink/40 dark:text-paper/40 hover:text-rust transition ml-0.5"
+            title="Clear"
           >
-            clear
+            ✕
           </button>
         )}
       </div>
+      {hint && <div className="text-[10px] text-ink/45 dark:text-paper/45 mt-1">{hint}</div>}
     </div>
   );
 }
+
+// Reusable two-field row: score + questions answered. Appears in DayCard and DayDetailModal.
+function SessionMetrics({ day, progress, updatePlanDay }) {
+  // Build a useful hint for questions — show the planned range from the schedule
+  const qHint = day.qTarget ? `target ${day.qTarget}` : null;
+  return (
+    <div className="flex flex-wrap gap-x-6 gap-y-3">
+      <MetricInput
+        day={day} progress={progress} updatePlanDay={updatePlanDay}
+        field="mockScore" label={getScoreLabel(day)}
+        max={100} step="0.5" suffix="%" integer={false} colorize={true}
+      />
+      <MetricInput
+        day={day} progress={progress} updatePlanDay={updatePlanDay}
+        field="questionsAnswered" label="Questions"
+        max={999} step="1" suffix="Q" integer={true} colorize={false}
+        hint={qHint}
+      />
+    </div>
+  );
+}
+
+// Backwards-compatible alias — old call sites that import ScoreInput still work
+function ScoreInput(props) { return <SessionMetrics {...props} />; }
 
 function DayCard({ day, progress, updatePlanDay, large, onStartReview, onLogMockMistake }) {
   const style = getPhaseStyle(day.phase);
@@ -3745,7 +3771,7 @@ function DayCard({ day, progress, updatePlanDay, large, onStartReview, onLogMock
 
             {/* Score input — for any non-rest study day */}
             <div className="border-t border-ink/8 dark:border-paper/8 pt-3 mb-3">
-              <ScoreInput day={day} progress={progress} updatePlanDay={updatePlanDay} />
+              <SessionMetrics day={day} progress={progress} updatePlanDay={updatePlanDay} />
             </div>
           </>
         )}
@@ -3977,8 +4003,11 @@ function DayDetailModal({ day, progress, updatePlanDay, onClose }) {
               </div>
 
               {!isRest && (
-                <div className="mt-4 grid grid-cols-1 sm:grid-cols-3 gap-4">
-                  <div className="sm:col-span-2">
+                <div className="mt-4 space-y-4">
+                  <div>
+                    <SessionMetrics day={day} progress={progress} updatePlanDay={updatePlanDay} />
+                  </div>
+                  <div>
                     <div className="text-[10px] uppercase tracking-widest text-ink/50 dark:text-paper/50 font-medium mb-1">Notes</div>
                     <Textarea
                       rows={3}
@@ -3987,9 +4016,6 @@ function DayDetailModal({ day, progress, updatePlanDay, onClose }) {
                       value={progress?.notes || ''}
                       onChange={(e) => updatePlanDay(day.date, { notes: e.target.value })}
                     />
-                  </div>
-                  <div>
-                    <ScoreInput day={day} progress={progress} updatePlanDay={updatePlanDay} />
                   </div>
                 </div>
               )}
@@ -4314,6 +4340,230 @@ function ScorePerformance({ planProgress }) {
 }
 
 // ─────────────────────────────────────────────────────────────────────────────
+// QUESTION VOLUME — analytics for raw question counts across the review period
+// Complements the score view: scores tell you accuracy, this tells you volume.
+// ─────────────────────────────────────────────────────────────────────────────
+
+function QuestionVolume({ planProgress }) {
+  const isDark = typeof document !== 'undefined' && document.documentElement.classList.contains('dark');
+
+  const sessionsWithQ = useMemo(() => {
+    const out = [];
+    for (const d of STUDY_SCHEDULE) {
+      const prog = planProgress[d.date];
+      if (prog?.questionsAnswered != null && prog.questionsAnswered > 0) {
+        out.push({
+          date: d.date,
+          dateObj: new Date(d.date + 'T00:00:00'),
+          questions: prog.questionsAnswered,
+          category: categorizeForScore(d),
+          topic: d.topic,
+          target: d.qTarget,
+          targetMax: d.qMax,
+        });
+      }
+    }
+    out.sort((a, b) => a.date.localeCompare(b.date));
+    return out;
+  }, [planProgress]);
+
+  const count = sessionsWithQ.length;
+  const totalQ = sessionsWithQ.reduce((s, x) => s + x.questions, 0);
+  const avgPerSession = count > 0 ? totalQ / count : 0;
+  const best = count > 0 ? Math.max(...sessionsWithQ.map(x => x.questions)) : 0;
+
+  // Last 7 days of activity (calendar days, not just logged days)
+  const recentQ = useMemo(() => {
+    const today = new Date(); today.setHours(0,0,0,0);
+    let sum = 0;
+    for (let i = 0; i < 7; i++) {
+      const d = new Date(today); d.setDate(d.getDate() - i);
+      const key = todayKey(d);
+      const prog = planProgress[key];
+      if (prog?.questionsAnswered) sum += prog.questionsAnswered;
+    }
+    return sum;
+  }, [planProgress]);
+
+  // By category breakdown
+  const byCategory = useMemo(() => {
+    const groups = {};
+    for (const d of sessionsWithQ) {
+      if (!groups[d.category]) groups[d.category] = [];
+      groups[d.category].push(d.questions);
+    }
+    return Object.entries(groups).map(([cat, qs]) => ({
+      category: cat,
+      count: qs.length,
+      total: qs.reduce((s, x) => s + x, 0),
+      avg: qs.reduce((s, x) => s + x, 0) / qs.length,
+    })).sort((a, b) => b.total - a.total);
+  }, [sessionsWithQ]);
+
+  // Chart geometry
+  const W = 600;
+  const H = 220;
+  const PADDING = { top: 20, right: 24, bottom: 36, left: 40 };
+  const innerW = W - PADDING.left - PADDING.right;
+  const innerH = H - PADDING.top - PADDING.bottom;
+  const maxBarValue = count > 0 ? Math.max(best, 30) : 30; // sensible Y-axis even when low
+  const xFor = (i) => count <= 1 ? PADDING.left + innerW / 2 : PADDING.left + (i / (count - 1)) * innerW;
+  const yFor = (q) => PADDING.top + innerH - (q / maxBarValue) * innerH;
+
+  // Bar width — shrink for many sessions, fixed cap for few
+  const barWidth = count > 0 ? Math.max(8, Math.min(28, innerW / count / 1.6)) : 16;
+
+  const colors = {
+    axis: isDark ? 'rgba(232,230,227,0.55)' : 'rgba(10,25,41,0.55)',
+    grid: isDark ? 'rgba(232,230,227,0.08)' : 'rgba(10,25,41,0.08)',
+    Mock: '#c14a2b',
+    Practice: '#b88a3a',
+    Recall: '#5a7a4f',
+  };
+
+  return (
+    <Card className="p-5">
+      <div className="flex items-start justify-between gap-3 mb-4 flex-wrap">
+        <div>
+          <h2 className="font-serif text-xl font-medium">Question volume</h2>
+          <p className="text-xs text-ink/55 dark:text-paper/55 mt-1">
+            How many questions you've worked across all logged sessions
+          </p>
+        </div>
+      </div>
+
+      {count === 0 ? (
+        <div className="text-sm text-ink/60 dark:text-paper/60 py-6 text-center">
+          Log a question count on any session (Plan → Today) to start tracking volume.
+        </div>
+      ) : (
+        <>
+          {/* Headline stats */}
+          <div className="grid grid-cols-2 md:grid-cols-4 gap-4 mb-5">
+            <div>
+              <div className="text-xs uppercase tracking-wider text-ink/50 dark:text-paper/50 font-medium">Total answered</div>
+              <div className="font-serif text-3xl font-medium mt-1 tabular-nums">{totalQ}</div>
+              <div className="text-xs text-ink/55 dark:text-paper/55 mt-0.5">questions all-time</div>
+            </div>
+            <div>
+              <div className="text-xs uppercase tracking-wider text-ink/50 dark:text-paper/50 font-medium">Avg / session</div>
+              <div className="font-serif text-3xl font-medium mt-1 tabular-nums">{avgPerSession.toFixed(1)}</div>
+              <div className="text-xs text-ink/55 dark:text-paper/55 mt-0.5">{count} {count === 1 ? 'session' : 'sessions'}</div>
+            </div>
+            <div>
+              <div className="text-xs uppercase tracking-wider text-ink/50 dark:text-paper/50 font-medium">Last 7 days</div>
+              <div className="font-serif text-3xl font-medium mt-1 tabular-nums">{recentQ}</div>
+              <div className="text-xs text-ink/55 dark:text-paper/55 mt-0.5">questions</div>
+            </div>
+            <div>
+              <div className="text-xs uppercase tracking-wider text-ink/50 dark:text-paper/50 font-medium">Best session</div>
+              <div className="font-serif text-3xl font-medium mt-1 tabular-nums">{best}</div>
+              <div className="text-xs text-ink/55 dark:text-paper/55 mt-0.5">in one session</div>
+            </div>
+          </div>
+
+          {/* Volume bar chart */}
+          <div className="overflow-x-auto -mx-2 mb-4">
+            <svg viewBox={`0 0 ${W} ${H}`} width="100%" preserveAspectRatio="xMidYMid meet" style={{ maxWidth: '100%', minWidth: 360 }}>
+              {/* Y grid + labels — 4 evenly spaced ticks */}
+              {[0, 0.25, 0.5, 0.75, 1.0].map((t, i) => {
+                const y = PADDING.top + innerH - t * innerH;
+                const labelVal = Math.round(maxBarValue * t);
+                return (
+                  <g key={i}>
+                    <line x1={PADDING.left} y1={y} x2={W - PADDING.right} y2={y}
+                      stroke={colors.grid} strokeWidth="1"
+                      strokeDasharray={t === 0 ? '0' : '2 4'} />
+                    <text x={PADDING.left - 6} y={y + 3} textAnchor="end" fontSize="10" fill={colors.axis} fontFamily="Inter, sans-serif">
+                      {labelVal}
+                    </text>
+                  </g>
+                );
+              })}
+
+              {/* Bars */}
+              {sessionsWithQ.map((d, i) => {
+                const x = xFor(i) - barWidth / 2;
+                const y = yFor(d.questions);
+                const h = (PADDING.top + innerH) - y;
+                const fill = colors[d.category] || colors.Recall;
+                return (
+                  <g key={i}>
+                    <rect x={x} y={y} width={barWidth} height={h} rx="2" fill={fill} opacity="0.85" />
+                    <title>{`${d.dateObj.toLocaleDateString(undefined, { month: 'short', day: 'numeric' })} · ${d.category}: ${d.questions} Q${d.target ? ` (target ${d.target})` : ''}`}</title>
+                  </g>
+                );
+              })}
+
+              {/* X-axis dates — first, middle (if enough), last */}
+              {count > 0 && (
+                <>
+                  <text x={xFor(0)} y={H - 16} textAnchor="start" fontSize="10" fill={colors.axis} fontFamily="Inter, sans-serif">
+                    {sessionsWithQ[0].dateObj.toLocaleDateString(undefined, { month: 'short', day: 'numeric' })}
+                  </text>
+                  {count >= 5 && (
+                    <text x={xFor(Math.floor((count - 1) / 2))} y={H - 16} textAnchor="middle" fontSize="10" fill={colors.axis} fontFamily="Inter, sans-serif">
+                      {sessionsWithQ[Math.floor((count - 1) / 2)].dateObj.toLocaleDateString(undefined, { month: 'short', day: 'numeric' })}
+                    </text>
+                  )}
+                  {count > 1 && (
+                    <text x={xFor(count - 1)} y={H - 16} textAnchor="end" fontSize="10" fill={colors.axis} fontFamily="Inter, sans-serif">
+                      {sessionsWithQ[count - 1].dateObj.toLocaleDateString(undefined, { month: 'short', day: 'numeric' })}
+                    </text>
+                  )}
+                </>
+              )}
+            </svg>
+          </div>
+
+          {/* Category legend */}
+          <div className="flex items-center justify-center gap-5 text-xs mb-4">
+            <div className="flex items-center gap-1.5">
+              <div className="w-2.5 h-2.5 rounded-sm" style={{ background: colors.Mock, opacity: 0.85 }} />
+              <span className="text-ink/65 dark:text-paper/65">Mock</span>
+            </div>
+            <div className="flex items-center gap-1.5">
+              <div className="w-2.5 h-2.5 rounded-sm" style={{ background: colors.Practice, opacity: 0.85 }} />
+              <span className="text-ink/65 dark:text-paper/65">Practice</span>
+            </div>
+            <div className="flex items-center gap-1.5">
+              <div className="w-2.5 h-2.5 rounded-sm" style={{ background: colors.Recall, opacity: 0.85 }} />
+              <span className="text-ink/65 dark:text-paper/65">Recall</span>
+            </div>
+          </div>
+
+          {/* By category breakdown */}
+          {byCategory.length > 1 && (
+            <div className="pt-4 border-t border-ink/8 dark:border-paper/8">
+              <div className="text-xs uppercase tracking-widest text-ink/55 dark:text-paper/55 font-medium mb-3">By session type</div>
+              <div className="space-y-2.5">
+                {byCategory.map(c => {
+                  const catColor = colors[c.category];
+                  const sharePct = totalQ > 0 ? (c.total / totalQ) * 100 : 0;
+                  return (
+                    <div key={c.category} className="flex items-center gap-3">
+                      <div className="w-20 text-sm font-medium">{c.category}</div>
+                      <div className="flex-1 h-6 bg-ink/5 dark:bg-paper/8 rounded overflow-hidden relative">
+                        <div className="h-full transition-all" style={{ width: `${sharePct}%`, background: catColor, opacity: 0.18 }} />
+                        <div className="h-full absolute top-0 left-0" style={{ width: `${sharePct}%`, borderRight: `2px solid ${catColor}` }} />
+                        <div className="absolute inset-0 flex items-center px-2 text-xs">
+                          <span className="font-serif font-medium tabular-nums">{c.total}</span>
+                          <span className="ml-2 text-ink/55 dark:text-paper/55">total · avg {c.avg.toFixed(1)}/session · {c.count} {c.count === 1 ? 'session' : 'sessions'}</span>
+                        </div>
+                      </div>
+                    </div>
+                  );
+                })}
+              </div>
+            </div>
+          )}
+        </>
+      )}
+    </Card>
+  );
+}
+
+// ─────────────────────────────────────────────────────────────────────────────
 // ANALYTICS
 // ─────────────────────────────────────────────────────────────────────────────
 
@@ -4390,6 +4640,7 @@ function Analytics({ cards, stats, derived, planProgress }) {
 
       {/* ── SCORE PERFORMANCE ── */}
       <ScorePerformance planProgress={planProgress} />
+      <QuestionVolume planProgress={planProgress} />
 
       {/* Section divider */}
       <div className="pt-2">
