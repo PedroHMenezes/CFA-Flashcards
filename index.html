@@ -1523,7 +1523,7 @@ function Nav({ view, setView, settings, setSettings, dueCount, syncStatus, syncE
 // ─────────────────────────────────────────────────────────────────────────────
 
 function Dashboard({ cards, derived, settings, stats, planProgress, setView, setReviewFilter, setEditingCard }) {
-  const examDate = new Date('2026-08-14');
+  const examDate = new Date(STUDY_PLAN_END + 'T00:00:00');
   const daysToExam = Math.max(0, Math.ceil((examDate - new Date()) / 86400000));
 
   const todayReviewed = useMemo(() => {
@@ -1578,7 +1578,7 @@ function Dashboard({ cards, derived, settings, stats, planProgress, setView, set
         // Pre-start: show a compact card pointing to the first session
         if (todayPlanIdx < 0) {
           const firstDay = STUDY_SCHEDULE[0];
-          const daysToStart = Math.max(0, Math.ceil((new Date(STUDY_PLAN_START) - new Date()) / 86400000));
+          const daysToStart = Math.max(0, Math.ceil((new Date(STUDY_PLAN_START + "T00:00:00") - new Date()) / 86400000));
           const firstDateLabel = (() => {
             const d = new Date(firstDay.date + 'T00:00:00');
             return d.toLocaleDateString(undefined, { weekday: 'short', month: 'short', day: 'numeric' });
@@ -3051,7 +3051,7 @@ function Plan({ planProgress, updatePlanDay, setView, setReviewFilter, showToast
       if (i < todayIdx) passedDays++;
     });
 
-    const daysToExam = Math.max(0, Math.ceil((new Date(STUDY_PLAN_END) - new Date()) / 86400000));
+    const daysToExam = Math.max(0, Math.ceil((new Date(STUDY_PLAN_END + 'T00:00:00') - new Date()) / 86400000));
     const totalDays = STUDY_SCHEDULE.length;
 
     return {
@@ -3085,7 +3085,7 @@ function Plan({ planProgress, updatePlanDay, setView, setReviewFilter, showToast
       // Pre-start: show the tracker (it will read as 0 progress) plus a
       // friendly "starts on" card and a peek at day 1.
       const firstDay = STUDY_SCHEDULE[0];
-      const daysUntilStart = Math.max(0, Math.ceil((new Date(STUDY_PLAN_START) - new Date()) / 86400000));
+      const daysUntilStart = Math.max(0, Math.ceil((new Date(STUDY_PLAN_START + "T00:00:00") - new Date()) / 86400000));
       return (
         <div className="space-y-5">
           {/* Tracker — empty actual, only planned line visible */}
@@ -3098,7 +3098,7 @@ function Plan({ planProgress, updatePlanDay, setView, setReviewFilter, showToast
             </div>
             <div className="font-serif text-2xl mb-1">Get ready</div>
             <p className="text-ink/60 dark:text-paper/60 text-sm max-w-md mx-auto">
-              Your study plan begins on {new Date(STUDY_PLAN_START).toLocaleDateString(undefined, { weekday: 'long', month: 'long', day: 'numeric' })}. Use these days to build your flashcard deck and warm up.
+              Your study plan begins on {new Date(STUDY_PLAN_START + "T00:00:00").toLocaleDateString(undefined, { weekday: 'long', month: 'long', day: 'numeric' })}. Use these days to build your flashcard deck and warm up.
             </p>
             <div className="mt-4 flex gap-2 justify-center flex-wrap">
               <Btn variant="rust" onClick={() => { setReviewFilter({ scope: 'due', topic: 'all', tag: 'all', difficulty: 'all' }); setView('review'); }}>Review flashcards</Btn>
@@ -3407,7 +3407,7 @@ function StudyTracker({ planProgress, todayIdx }) {
     d.setDate(d.getDate() + Math.ceil(daysNeeded));
     readyDate = d;
   }
-  const examDate = new Date(STUDY_PLAN_END);
+  const examDate = new Date(STUDY_PLAN_END + 'T00:00:00');
   // Only show on-pace pill once we have meaningful data (plan started + at least 7 days of progress)
   const onPaceForExam = (planStarted && daysElapsed >= 7 && readyDate) ? readyDate <= examDate : null;
 
@@ -3429,7 +3429,7 @@ function StudyTracker({ planProgress, todayIdx }) {
 
   // Days until exam (or until plan start, pre-start)
   const daysToExam = Math.max(0, Math.ceil((examDate - new Date()) / 86400000));
-  const daysToStart = Math.max(0, Math.ceil((new Date(STUDY_PLAN_START) - new Date()) / 86400000));
+  const daysToStart = Math.max(0, Math.ceil((new Date(STUDY_PLAN_START + "T00:00:00") - new Date()) / 86400000));
 
   // ── SVG geometry ──
   const W = 560;
@@ -3444,17 +3444,24 @@ function StudyTracker({ planProgress, todayIdx }) {
   // Build SVG paths
   const plannedPath = series.map((p, i) => `${i === 0 ? 'M' : 'L'} ${xFor(i)} ${yFor(p.planned)}`).join(' ');
 
+  // Anchor the actual line at (start, 0) so even small early progress reads
+  // as a visible upward slope, not a sliver against the x-axis baseline.
   const actualPoints = series.filter(p => p.actual != null);
-  const actualLinePath = actualPoints.map((p, i) => `${i === 0 ? 'M' : 'L'} ${xFor(p.idx)} ${yFor(p.actual)}`).join(' ');
-  const actualAreaPath = actualPoints.length > 0
-    ? `${actualLinePath} L ${xFor(actualPoints[actualPoints.length - 1].idx)} ${yFor(0)} L ${xFor(0)} ${yFor(0)} Z`
+  const actualLinePoints = actualPoints.length > 0
+    ? [{ idx: 0, actual: 0 }, ...actualPoints]
+    : [];
+  const actualLinePath = actualLinePoints.map((p, i) => `${i === 0 ? 'M' : 'L'} ${xFor(p.idx)} ${yFor(p.actual)}`).join(' ');
+  const actualAreaPath = actualLinePoints.length > 1
+    ? `${actualLinePath} L ${xFor(actualPoints[actualPoints.length - 1].idx)} ${yFor(0)} Z`
     : '';
 
   // Y-axis ticks: 0, 25, 50, 75, 100%
   const yTicks = [0, 0.25, 0.5, 0.75, 1.0];
 
   // X-axis labels: start, today, end
-  const startDate = new Date(STUDY_PLAN_START);
+  // Append T00:00:00 to force local-timezone parsing (otherwise UTC midnight
+  // shifts the date back a day in negative-offset timezones like São Paulo).
+  const startDate = new Date(STUDY_PLAN_START + 'T00:00:00');
   const fmtDate = (d) => d.toLocaleDateString(undefined, { month: 'short', day: 'numeric' });
 
   // Theme colors (use rust as primary, ink-grey for planned reference)
@@ -4149,7 +4156,17 @@ function ScorePerformance({ planProgress }) {
   const innerW = W - PADDING.left - PADDING.right;
   const innerH = H - PADDING.top - PADDING.bottom;
 
-  const xFor = (i) => count <= 1 ? PADDING.left + innerW / 2 : PADDING.left + (i / (count - 1)) * innerW;
+  // X-positioning: cluster dots when few sessions; stretch when many.
+  const SLOT_MIN = 40;
+  const SLOT_MAX = 80;
+  const naturalSlot = count > 0 ? innerW / count : innerW;
+  const slot = Math.min(SLOT_MAX, Math.max(SLOT_MIN, naturalSlot));
+  const useStretch = count > 1 && naturalSlot <= SLOT_MIN;
+  const xFor = (i) => {
+    if (count <= 1) return PADDING.left + slot / 2;
+    if (useStretch) return PADDING.left + (i / (count - 1)) * innerW;
+    return PADDING.left + slot / 2 + i * slot;
+  };
   const yFor = (score) => PADDING.top + innerH - (score / 100) * innerH;
 
   // Build the line path
@@ -4272,22 +4289,23 @@ function ScorePerformance({ planProgress }) {
                 </g>
               ))}
 
-              {/* X-axis date labels — first, middle, last */}
-              {count > 0 && (
+              {/* X-axis date labels */}
+              {count > 0 && count <= 8 && scoredDays.map((d, i) => (
+                <text key={`sxl-${i}`} x={xFor(i)} y={H - 16} textAnchor="middle" fontSize="10" fill={colors.axis} fontFamily="Inter, sans-serif">
+                  {d.dateObj.toLocaleDateString(undefined, { month: 'short', day: 'numeric' })}
+                </text>
+              ))}
+              {count > 8 && (
                 <>
-                  <text x={xFor(0)} y={H - 16} textAnchor="start" fontSize="10" fill={colors.axis} fontFamily="Inter, sans-serif">
+                  <text x={xFor(0)} y={H - 16} textAnchor="middle" fontSize="10" fill={colors.axis} fontFamily="Inter, sans-serif">
                     {scoredDays[0].dateObj.toLocaleDateString(undefined, { month: 'short', day: 'numeric' })}
                   </text>
-                  {count >= 5 && (
-                    <text x={xFor(Math.floor((count - 1) / 2))} y={H - 16} textAnchor="middle" fontSize="10" fill={colors.axis} fontFamily="Inter, sans-serif">
-                      {scoredDays[Math.floor((count - 1) / 2)].dateObj.toLocaleDateString(undefined, { month: 'short', day: 'numeric' })}
-                    </text>
-                  )}
-                  {count > 1 && (
-                    <text x={xFor(count - 1)} y={H - 16} textAnchor="end" fontSize="10" fill={colors.axis} fontFamily="Inter, sans-serif">
-                      {scoredDays[count - 1].dateObj.toLocaleDateString(undefined, { month: 'short', day: 'numeric' })}
-                    </text>
-                  )}
+                  <text x={xFor(Math.floor((count - 1) / 2))} y={H - 16} textAnchor="middle" fontSize="10" fill={colors.axis} fontFamily="Inter, sans-serif">
+                    {scoredDays[Math.floor((count - 1) / 2)].dateObj.toLocaleDateString(undefined, { month: 'short', day: 'numeric' })}
+                  </text>
+                  <text x={xFor(count - 1)} y={H - 16} textAnchor="middle" fontSize="10" fill={colors.axis} fontFamily="Inter, sans-serif">
+                    {scoredDays[count - 1].dateObj.toLocaleDateString(undefined, { month: 'short', day: 'numeric' })}
+                  </text>
                 </>
               )}
             </svg>
@@ -4407,11 +4425,25 @@ function QuestionVolume({ planProgress }) {
   const innerW = W - PADDING.left - PADDING.right;
   const innerH = H - PADDING.top - PADDING.bottom;
   const maxBarValue = count > 0 ? Math.max(best, 30) : 30; // sensible Y-axis even when low
-  const xFor = (i) => count <= 1 ? PADDING.left + innerW / 2 : PADDING.left + (i / (count - 1)) * innerW;
+
+  // X-positioning: when few sessions, use a fixed slot width (so 2 bars don't
+  // sit at the extreme edges with a chasm between). When many, spread evenly
+  // across the full chart.
+  const SLOT_MIN = 40;    // px per session when sparse
+  const SLOT_MAX = 80;    // cap so a single session bar isn't huge
+  const naturalSlot = count > 0 ? innerW / count : innerW;
+  const slot = Math.min(SLOT_MAX, Math.max(SLOT_MIN, naturalSlot));
+  // If we have lots of sessions, spread evenly (slot becomes < SLOT_MIN naturally).
+  const useStretch = count > 1 && naturalSlot <= SLOT_MIN;
+  const xFor = (i) => {
+    if (count <= 1) return PADDING.left + slot / 2;
+    if (useStretch) return PADDING.left + (i / (count - 1)) * innerW;
+    return PADDING.left + slot / 2 + i * slot;
+  };
   const yFor = (q) => PADDING.top + innerH - (q / maxBarValue) * innerH;
 
-  // Bar width — shrink for many sessions, fixed cap for few
-  const barWidth = count > 0 ? Math.max(8, Math.min(28, innerW / count / 1.6)) : 16;
+  // Bar width — keep proportional to slot width so it reads as a category bar
+  const barWidth = Math.max(10, Math.min(32, slot * 0.55));
 
   const colors = {
     axis: isDark ? 'rgba(232,230,227,0.55)' : 'rgba(10,25,41,0.55)',
@@ -4495,22 +4527,23 @@ function QuestionVolume({ planProgress }) {
                 );
               })}
 
-              {/* X-axis dates — first, middle (if enough), last */}
-              {count > 0 && (
+              {/* X-axis dates */}
+              {count > 0 && count <= 8 && sessionsWithQ.map((d, i) => (
+                <text key={`xl-${i}`} x={xFor(i)} y={H - 16} textAnchor="middle" fontSize="10" fill={colors.axis} fontFamily="Inter, sans-serif">
+                  {d.dateObj.toLocaleDateString(undefined, { month: 'short', day: 'numeric' })}
+                </text>
+              ))}
+              {count > 8 && (
                 <>
-                  <text x={xFor(0)} y={H - 16} textAnchor="start" fontSize="10" fill={colors.axis} fontFamily="Inter, sans-serif">
+                  <text x={xFor(0)} y={H - 16} textAnchor="middle" fontSize="10" fill={colors.axis} fontFamily="Inter, sans-serif">
                     {sessionsWithQ[0].dateObj.toLocaleDateString(undefined, { month: 'short', day: 'numeric' })}
                   </text>
-                  {count >= 5 && (
-                    <text x={xFor(Math.floor((count - 1) / 2))} y={H - 16} textAnchor="middle" fontSize="10" fill={colors.axis} fontFamily="Inter, sans-serif">
-                      {sessionsWithQ[Math.floor((count - 1) / 2)].dateObj.toLocaleDateString(undefined, { month: 'short', day: 'numeric' })}
-                    </text>
-                  )}
-                  {count > 1 && (
-                    <text x={xFor(count - 1)} y={H - 16} textAnchor="end" fontSize="10" fill={colors.axis} fontFamily="Inter, sans-serif">
-                      {sessionsWithQ[count - 1].dateObj.toLocaleDateString(undefined, { month: 'short', day: 'numeric' })}
-                    </text>
-                  )}
+                  <text x={xFor(Math.floor((count - 1) / 2))} y={H - 16} textAnchor="middle" fontSize="10" fill={colors.axis} fontFamily="Inter, sans-serif">
+                    {sessionsWithQ[Math.floor((count - 1) / 2)].dateObj.toLocaleDateString(undefined, { month: 'short', day: 'numeric' })}
+                  </text>
+                  <text x={xFor(count - 1)} y={H - 16} textAnchor="middle" fontSize="10" fill={colors.axis} fontFamily="Inter, sans-serif">
+                    {sessionsWithQ[count - 1].dateObj.toLocaleDateString(undefined, { month: 'short', day: 'numeric' })}
+                  </text>
                 </>
               )}
             </svg>
