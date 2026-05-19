@@ -3411,16 +3411,20 @@ function StudyTracker({ planProgress, todayIdx }) {
   // Only show on-pace pill once we have meaningful data (plan started + at least 7 days of progress)
   const onPaceForExam = (planStarted && daysElapsed >= 7 && readyDate) ? readyDate <= examDate : null;
 
-  // Average hours per week — actual if plan started, otherwise show the planned average
+  // Average hours per week — actual if plan started, otherwise show the planned average.
+  // Definition: total hours completed in the recent window ÷ duration of that window in weeks.
+  // For the first 4 weeks, the window is "everything since plan start" (so you get a
+  // meaningful number from day 1). After 4 weeks, it's a trailing 4-week window.
   let avgPerWeek;
   let avgPerWeekLabel = 'Average per week';
   if (planStarted) {
-    const recentWeeks = Math.min(4, Math.ceil(daysElapsed / 7));
-    const recentWindow = series.slice(Math.max(0, todayIdx - recentWeeks * 7), todayIdx + 1);
-    const recentActual = recentWindow.length > 1
-      ? (recentWindow[recentWindow.length - 1].actual || 0) - (recentWindow[0].actual || 0)
-      : actualSoFar;
-    avgPerWeek = recentWindow.length > 0 ? (recentActual / Math.max(1, recentWindow.length / 7)) : 0;
+    const windowDays = Math.min(daysElapsed, 28);          // up to 4 weeks
+    const windowStartIdx = Math.max(0, todayIdx - windowDays + 1);
+    const startActual = windowStartIdx > 0 ? (series[windowStartIdx - 1].actual || 0) : 0;
+    const endActual   = series[todayIdx].actual || 0;
+    const windowHours = endActual - startActual;
+    const windowWeeks = windowDays / 7;
+    avgPerWeek = windowWeeks > 0 ? windowHours / windowWeeks : 0;
   } else {
     // Pre-start: show planned weekly average so the user knows what's coming
     avgPerWeek = totalPlanned / (STUDY_SCHEDULE.length / 7);
